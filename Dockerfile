@@ -19,11 +19,15 @@ RUN <<EOF
 EOF
 
 # Pull the TrueNAS-built kernel headers .deb directly from the TrueNAS download mirror.
+# Extract into a staging dir first — the .deb ships content outside /usr/src/ that
+# would otherwise clobber the builder image's /usr/bin/ etc.
 RUN <<EOF
   curl -fSsL --retry 3 -o /tmp/headers.deb "${KERNEL_HEADERS_URL}"
-  dpkg-deb -x /tmp/headers.deb /
+  mkdir -p /tmp/headers /usr/src
+  dpkg-deb -x /tmp/headers.deb /tmp/headers
+  cp -a "/tmp/headers/usr/src/${KERNEL_HEADERS_DIR}" /usr/src/
   test -f "/usr/src/${KERNEL_HEADERS_DIR}/Makefile"
-  rm /tmp/headers.deb
+  rm -rf /tmp/headers /tmp/headers.deb
 EOF
 
 ENV KSRC=/usr/src/${KERNEL_HEADERS_DIR}
