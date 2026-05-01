@@ -1,0 +1,60 @@
+name: build nvidia.raw
+
+on:
+  workflow_dispatch:
+    inputs:
+      nvidia_driver_version:
+        description: 'NVIDIA proprietary driver version (must match the nvidia-smi version TrueNAS ships)'
+        required: true
+        default: '570.172.08'
+        type: string
+      kernel_release:
+        description: 'TrueNAS kernel release (uname -r on the NAS)'
+        required: true
+        default: '6.12.33-production+truenas'
+        type: string
+      kernel_headers_dir:
+        description: 'Directory inside /usr/src that the headers .deb installs to'
+        required: true
+        default: 'linux-headers-truenas-production-amd64'
+        type: string
+      kernel_headers_url:
+        description: 'URL to the TrueNAS linux-headers .deb'
+        required: true
+        default: 'https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.0/packages/linux-headers-truenas-production-amd64_6.12.33-production+truenas-1_amd64.deb'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build nvidia.raw
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: tn-nvidia-legacy-builder:ci
+          build-args: |
+            NVIDIA_DRIVER_VERSION=${{ inputs.nvidia_driver_version }}
+            KERNEL_RELEASE=${{ inputs.kernel_release }}
+            KERNEL_HEADERS_DIR=${{ inputs.kernel_headers_dir }}
+            KERNEL_HEADERS_URL=${{ inputs.kernel_headers_url }}
+
+      - name: Extract artifact
+        run: |
+          mkdir -p out
+          docker run --rm tn-nvidia-legacy-builder:ci > out/nvidia.raw
+          ls -lh out/nvidia.raw
+          file out/nvidia.raw
+
+      - name: Upload nvidia.raw
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-${{ inputs.nvidia_driver_version }}-${{ inputs.kernel_release }}
+          path: out/nvidia.raw
+          if-no-files-found: error
