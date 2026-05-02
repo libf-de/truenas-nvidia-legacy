@@ -23,6 +23,11 @@ on:
         required: true
         default: 'https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.0/packages/linux-headers-truenas-production-amd64_6.12.33-production+truenas-1_amd64.deb'
         type: string
+      kernel_image_url:
+        description: 'URL to the TrueNAS linux-image .deb (used to regenerate modules.dep)'
+        required: true
+        default: 'https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.0/packages/linux-image-truenas-production-amd64_6.12.33-production+truenas-1_amd64.deb'
+        type: string
 
 jobs:
   build:
@@ -44,6 +49,7 @@ jobs:
             KERNEL_RELEASE=${{ inputs.kernel_release }}
             KERNEL_HEADERS_DIR=${{ inputs.kernel_headers_dir }}
             KERNEL_HEADERS_URL=${{ inputs.kernel_headers_url }}
+            KERNEL_IMAGE_URL=${{ inputs.kernel_image_url }}
 
       - name: Extract artifact
         run: |

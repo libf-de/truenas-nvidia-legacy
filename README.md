@@ -82,9 +82,16 @@ zfs set readonly=off "$POOL"
 cp /tmp/nvidia.raw /usr/share/truenas/sysext-extensions/nvidia.raw
 zfs set readonly=on "$POOL"
 
-systemd-sysext refresh
+systemd-sysext merge
+ldconfig                          # rebuild /etc/ld.so.cache so the new libnvidia-ml.so.1 is found
 modprobe nvidia && nvidia-smi
 ```
+
+Note: if a previous sysext is already merged, run `systemd-sysext unmerge`
+*before* flipping the dataset to `readonly=off` — the overlay otherwise
+blocks ZFS from remounting it. `ldconfig` is needed once after install
+because `/etc/ld.so.cache` lives in `/etc` (not extended by the sysext)
+and won't see the new SONAME otherwise.
 
 Snapshot the dataset before the first install if you want a quick rollback.
 

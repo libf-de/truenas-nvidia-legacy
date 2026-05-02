@@ -19,9 +19,11 @@ cat <<'EOF'
 
   # on the NAS:
   POOL=$(zfs list -H -o name | awk '/\/usr$/{print; exit}')
+  systemd-sysext unmerge
   zfs set readonly=off "$POOL"
   cp /tmp/nvidia.raw /usr/share/truenas/sysext-extensions/nvidia.raw
   zfs set readonly=on "$POOL"
-  systemd-sysext refresh
+  systemd-sysext merge
+  ldconfig
   modprobe nvidia && nvidia-smi
 EOF
