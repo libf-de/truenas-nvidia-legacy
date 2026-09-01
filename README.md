@@ -19,6 +19,14 @@ The proprietary `570.172.08` userland is unchanged between the two flavours,
 so we only need to swap the kernel modules (and ship the matching `nvidia-smi`
 / `libnvidia-ml.so` so version-magic stays consistent).
 
+The shipped `nvidia.raw` carries more than the driver, though — it also ships
+the NVIDIA container toolkit (`nvidia-ctk`, `nvidia-container-runtime`,
+`nvidia-container-cli`, `libnvidia-container.so.1`, ...) and the full driver
+userland (libcuda, NVENC/NVDEC, ...). Since our output *replaces* that file,
+the build **overlays onto a copy of the stock raw** instead of building a
+modules-only sysext. Everything we don't touch stays exactly at the version
+TrueNAS shipped, and Docker GPU passthrough keeps working.
+
 ## How it works
 
 1. Pulls the TrueNAS-built `linux-headers-truenas-production-amd64` `.deb`
@@ -27,21 +35,60 @@ so we only need to swap the kernel modules (and ship the matching `nvidia-smi`
    `NVIDIA-Linux-x86_64-<version>.run` and compiles `nvidia.ko` /
    `nvidia-modeset.ko` / `nvidia-uvm.ko` / `nvidia-drm.ko` against those
    headers.
-3. Stages the modules under
-   `usr/lib/modules/<kver>/extra/nvidia/`, plus `nvidia-smi` and
-   `libnvidia-ml.so*`, plus an `extension-release.nvidia` file with
-   `ID=_any` (matches what TrueNAS's own sysext declares).
+3. `unsquashfs`es the stock `orig/nvidia.raw` into a staging tree, then
+   overlays onto it: our `.ko` files (into whatever directory the stock raw
+   used), the regenerated `modules.dep`/`modules.alias`/… , and our
+   `nvidia-smi` / `libnvidia-ml.so*` / `libnvidia-cfg.so*` at the stock paths.
+   Every kernel module the stock raw carried is deleted first, so no
+   open-flavour `.ko` survives. The stock `extension-release.nvidia` is kept if
+   it already declares `ID=_any`.
 4. `mksquashfs` → `nvidia.raw`.
+
+The image self-checks before packing: container toolkit present, `nvidia.ko`
+reports `license: NVIDIA` (proprietary flavour) and the target vermagic, and
+the set of shipped modules equals the set just built.
 
 ## Local build
 
-Requirements: Docker.
+Requirements: Docker, plus a copy of the stock sysext at `orig/nvidia.raw`.
+
+Grab it off the NAS **before** overwriting it:
+
+```sh
+mkdir -p orig
+scp root@truenas.local:/usr/share/truenas/sysext-extensions/nvidia.raw orig/
+```
+
+Already overwrote it? Pull it out of a ZFS snapshot of the `/usr` dataset:
+
+```sh
+ls /usr/.zfs/snapshot/<snap>/share/truenas/sysext-extensions/nvidia.raw
+```
+
+Then:
 
 ```sh
 ./build.sh
 ```
 
 Output: `out/nvidia.raw`.
+
+### Building without the stock raw (fallback)
+
+```sh
+CTK_FALLBACK=1 ./build.sh
+```
+
+This skips the overlay and instead adds NVIDIA's apt repo in the builder,
+`dpkg -x`-ing `nvidia-container-toolkit`, `nvidia-container-toolkit-base`,
+`libnvidia-container1` and `libnvidia-container-tools` into the staging tree.
+You get the container toolkit but **not** the rest of the stock userland
+(libcuda, NVENC/NVDEC, …), so anything on the host that linked against those
+breaks. Prefer the overlay path.
+
+Note: `/etc/nvidia-container-runtime/config.toml` is not covered by a sysext
+(sysexts only extend `/usr` and `/opt`), so it has to exist on the host
+already — it does if the stock raw was ever merged.
 
 To target a different driver, kernel, or headers URL:
 
@@ -60,6 +107,11 @@ docker run --rm tn-nvidia-legacy-builder > out/nvidia.raw
 the TrueNAS 25.10.3 / kernel 6.12.33 / driver 570.172.08 combination — for
 that target, just hit "Run workflow". The `nvidia.raw` artefact is attached
 to the run.
+
+The runner has no route to the NAS, so the stock raw has to come over HTTP:
+set the optional `orig_raw_url` input to somewhere the runner can `curl` a
+copy of `/usr/share/truenas/sysext-extensions/nvidia.raw` from. Left empty,
+the job takes the fallback path above and says so in the job summary.
 
 Override the inputs to retarget a different TrueNAS version: bump
 `kernel_release` and `kernel_headers_url` together (the URL is published
@@ -98,7 +150,14 @@ Snapshot the dataset before the first install if you want a quick rollback.
 ## Caveats
 
 - **Replaces, not augments.** Two sysexts owning `nvidia.ko` would conflict,
-  so this overwrites the shipped `nvidia.raw`. Keep a copy of the original.
+  so this overwrites the shipped `nvidia.raw`. Keep a copy of the original —
+  it is also the *build input*.
+- **Supersedes the stock raw wholesale.** The output is not a modules-only
+  sysext: it is the stock extension with our modules and matching `nvidia-smi`
+  / `libnvidia-ml` swapped in, so it carries the container toolkit and the
+  whole driver userland too. Rebuild it against the new stock raw after any
+  TrueNAS upgrade that bumps the driver — installing an old build over a newer
+  stock raw would roll that userland back.
 - **Version magic.** TrueNAS 25.10 + kernel 6.12 ships built with gcc-12,
   which is also `debian:bookworm`'s default — vermagic should line up. If
   `modprobe nvidia` complains about version-magic mismatch, the toolchain

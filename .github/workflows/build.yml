@@ -28,12 +28,33 @@ on:
         required: true
         default: 'https://download.truenas.com/TrueNAS-SCALE-Goldeye/25.10.0/packages/linux-image-truenas-production-amd64_6.12.33-production+truenas-1_amd64.deb'
         type: string
+      orig_raw_url:
+        description: 'URL the runner can fetch the stock TrueNAS nvidia.raw from (leave empty to use the NVIDIA-repo fallback for the container toolkit)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # The runner has no route to the NAS, so the stock raw has to be reachable
+      # over HTTP or we fall back to fetching the container toolkit from NVIDIA.
+      - name: Fetch stock nvidia.raw
+        id: orig
+        env:
+          ORIG_RAW_URL: ${{ inputs.orig_raw_url }}
+        run: |
+          if [ -n "$ORIG_RAW_URL" ]; then
+            mkdir -p orig
+            curl -fSsL --retry 3 -o orig/nvidia.raw "$ORIG_RAW_URL"
+            file orig/nvidia.raw
+            echo "ctk_fallback=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "ctk_fallback=1" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -50,6 +71,7 @@ jobs:
             KERNEL_HEADERS_DIR=${{ inputs.kernel_headers_dir }}
             KERNEL_HEADERS_URL=${{ inputs.kernel_headers_url }}
             KERNEL_IMAGE_URL=${{ inputs.kernel_image_url }}
+            CTK_FALLBACK=${{ steps.orig.outputs.ctk_fallback }}
 
       - name: Extract artifact
         run: |
@@ -57,6 +79,26 @@ jobs:
           docker run --rm tn-nvidia-legacy-builder:ci > out/nvidia.raw
           ls -lh out/nvidia.raw
           file out/nvidia.raw
+
+      - name: Job summary
+        if: always()
+        env:
+          CTK_FALLBACK: ${{ steps.orig.outputs.ctk_fallback }}
+        run: |
+          {
+            echo "### nvidia.raw build"
+            echo
+            echo "- driver: \`${{ inputs.nvidia_driver_version }}\` (proprietary)"
+            echo "- kernel: \`${{ inputs.kernel_release }}\`"
+            if [ "$CTK_FALLBACK" = "1" ]; then
+              echo "- base: **none** — no \`orig_raw_url\` given, so this build did **not** overlay onto TrueNAS's stock \`nvidia.raw\`."
+              echo "- The container toolkit was pulled from NVIDIA's apt repo, but the rest of the stock userland (libcuda, NVENC/NVDEC, ...) is **not** in this artifact — installing it over the shipped raw drops those libraries."
+              echo "- Re-run with \`orig_raw_url\` pointing at a copy of \`/usr/share/truenas/sysext-extensions/nvidia.raw\` for a complete build."
+              echo "- \`/etc/nvidia-container-runtime/config.toml\` is not covered by a sysext and must already exist on the host."
+            else
+              echo "- base: stock \`nvidia.raw\` from \`${{ inputs.orig_raw_url }}\` (container toolkit and full driver userland preserved)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload nvidia.raw
         uses: actions/upload-artifact@v4
