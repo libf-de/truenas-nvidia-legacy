@@ -106,11 +106,20 @@ RUN <<EOF
   cat /build/stage-mode
 EOF
 
-# Fallback path only: no stock raw to inherit from, so pull the container
-# toolkit straight from NVIDIA's repo. This gets CTK but *not* the rest of the
-# stock userland (libcuda &c.) — the overlay path is the better one.
+# Pull the container toolkit from NVIDIA's repo when the staging tree doesn't
+# already carry it. On the fallback path that's always (empty tree); on the
+# overlay path only when the stock raw turns out to be missing pieces — e.g. it
+# ships libnvidia-container but not /usr/bin/nvidia-container-runtime-hook,
+# which is what dockerd execs for GPU passthrough:
+#   Error response from daemon: exec: "nvidia-container-runtime-hook": executable file not found in $PATH
+# Existing files are never overwritten (cp -n), so the stock userland wins.
 RUN <<EOF
-  if [ "$(cat /build/stage-mode)" != "fallback" ]; then exit 0; fi
+  NEED=0
+  for b in nvidia-container-runtime-hook nvidia-container-runtime nvidia-ctk; do
+    [ -x "/stage/usr/bin/${b}" ] || NEED=1
+  done
+  if [ "${NEED}" = "0" ]; then echo "container toolkit already staged"; exit 0; fi
+
   install -d /usr/share/keyrings
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
     | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -128,7 +137,8 @@ RUN <<EOF
 
   # A sysext may only extend /usr and /opt; /etc config has to live on the host.
   rm -rf /tmp/ctk/x/etc /tmp/ctk/x/usr/share/doc /tmp/ctk/x/usr/share/man
-  cp -a /tmp/ctk/x/usr /stage/
+  mkdir -p /stage/usr
+  cp -a -n /tmp/ctk/x/usr/. /stage/usr/
   rm -rf /tmp/ctk
   ls -l /stage/usr/bin
 EOF
@@ -206,8 +216,18 @@ EOF
 # Sanity-check the staged tree before packing: container toolkit present, our
 # modules are the proprietary flavour, nothing else left behind.
 RUN <<EOF
-  CTK="$(find /stage \( -name 'nvidia-ctk' -o -name 'libnvidia-container.so.1*' \) -print -quit)"
-  test -n "${CTK}" || { echo "ERROR: no container toolkit in the staged tree" >&2; exit 1; }
+  # dockerd looks these up in $PATH, so they have to sit in /usr/bin — not just
+  # somewhere under /stage. nvidia-container-runtime-hook is the one dockerd
+  # execs per GPU container; without it every `--gpus` run dies with
+  # `exec: "nvidia-container-runtime-hook": executable file not found in $PATH`.
+  for b in nvidia-container-runtime-hook nvidia-container-runtime \
+           nvidia-ctk nvidia-container-cli; do
+    test -x "/stage/usr/bin/${b}" \
+      || { echo "ERROR: /usr/bin/${b} missing from the staged tree" >&2; exit 1; }
+  done
+  test -n "$(find /stage/usr -name 'libnvidia-container.so.1*' -print -quit)" \
+    || { echo "ERROR: libnvidia-container.so.1 missing from the staged tree" >&2; exit 1; }
+  ls -l /stage/usr/bin/nvidia-container*
 
   KO="$(find /stage/usr/lib/modules -name 'nvidia.ko' | head -1 || true)"
   test -n "${KO}"

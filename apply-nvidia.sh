@@ -42,6 +42,14 @@ ldconfig
 modprobe nvidia
 nvidia-smi
 
+# dockerd execs the hook by name; if it isn't on PATH every `--gpus` container
+# fails with: exec: "nvidia-container-runtime-hook": executable file not found in $PATH
+for b in nvidia-container-runtime-hook nvidia-container-runtime nvidia-ctk nvidia-container-cli; do
+  command -v "$b" >/dev/null || echo "WARN: $b not on PATH after merge"
+done
+[[ -f /etc/nvidia-container-runtime/config.toml ]] \
+  || echo "WARN: /etc/nvidia-container-runtime/config.toml missing (a sysext cannot ship /etc) — run: nvidia-ctk config default --output /etc/nvidia-container-runtime/config.toml"
+
 echo
 echo "done. rollback: zfs rollback $SNAP  (after systemd-sysext unmerge)"
 echo "restart your GPU containers now."

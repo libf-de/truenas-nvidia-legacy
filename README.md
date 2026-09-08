@@ -44,9 +44,21 @@ TrueNAS shipped, and Docker GPU passthrough keeps working.
    it already declares `ID=_any`.
 4. `mksquashfs` → `nvidia.raw`.
 
-The image self-checks before packing: container toolkit present, `nvidia.ko`
-reports `license: NVIDIA` (proprietary flavour) and the target vermagic, and
-the set of shipped modules equals the set just built.
+The image self-checks before packing: `nvidia-container-runtime-hook`,
+`nvidia-container-runtime`, `nvidia-ctk` and `nvidia-container-cli` are all
+executable in `/usr/bin` (dockerd resolves the hook via `$PATH`, so anywhere
+else doesn't count), `libnvidia-container.so.1` is present, `nvidia.ko` reports
+`license: NVIDIA` (proprietary flavour) and the target vermagic, and the set of
+shipped modules equals the set just built.
+
+If the staged tree is missing any of those binaries — including on the overlay
+path, when the stock raw turns out not to carry them — the build fills the gaps
+from NVIDIA's apt repo. Existing files are never overwritten, so the stock
+userland always wins. Without this, GPU containers fail with:
+
+```
+Error response from daemon: exec: "nvidia-container-runtime-hook": executable file not found in $PATH
+```
 
 ## Local build
 
