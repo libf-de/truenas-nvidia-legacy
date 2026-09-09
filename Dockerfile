@@ -63,24 +63,6 @@ RUN <<EOF
   ls -l *.ko
 EOF
 
-# Run depmod over the merged tree (host modules + our nvidia modules) so
-# the regenerated modules.dep / modules.alias / modules.symbols carry our
-# additions. We then ship only the regenerated index files in the sysext.
-RUN <<EOF
-  STAGE=/tmp/depmod
-  # locate the modules dir in the linux-image deb (older debs use /lib, newer /usr/lib)
-  if [ -d "/tmp/image/usr/lib/modules/${KERNEL_RELEASE}" ]; then
-    SRC="/tmp/image/usr/lib/modules/${KERNEL_RELEASE}"
-  else
-    SRC="/tmp/image/lib/modules/${KERNEL_RELEASE}"
-  fi
-  mkdir -p "${STAGE}/lib/modules/${KERNEL_RELEASE}/extra/nvidia"
-  cp -a "${SRC}/." "${STAGE}/lib/modules/${KERNEL_RELEASE}/"
-  cp /build/nv/kernel/*.ko "${STAGE}/lib/modules/${KERNEL_RELEASE}/extra/nvidia/"
-  depmod -b "${STAGE}" "${KERNEL_RELEASE}"
-  ls "${STAGE}/lib/modules/${KERNEL_RELEASE}/" | grep -E '^modules\.'
-EOF
-
 # Optional build input: the stock TrueNAS nvidia.raw. Our output *replaces* that
 # file, so overlaying onto it is what keeps the container toolkit and the rest of
 # the driver userland (libcuda, NVENC/NVDEC, ...) in the shipped extension.
@@ -146,14 +128,26 @@ EOF
 # Overlay our proprietary-flavour build onto the staging tree.
 RUN <<EOF
   STAGE=/stage
-  STAGEMOD="/tmp/depmod/lib/modules/${KERNEL_RELEASE}"
   mkdir -p "${STAGE}/usr/lib/modules"
 
   # Install into whatever directory the stock raw used for nvidia.ko; only fall
   # back to extra/nvidia when there was nothing to match (fallback path, or a
   # stock raw built for a different kernel release).
-  MODDIR="$(find "${STAGE}/usr/lib/modules/${KERNEL_RELEASE}" -name 'nvidia.ko*' -printf '%h\n' 2>/dev/null | head -1 || true)"
-  MODDIR="${MODDIR:-${STAGE}/usr/lib/modules/${KERNEL_RELEASE}/extra/nvidia}"
+  #
+  # depmod records module paths relative to /lib/modules/<release>, so we track
+  # that directory as a relative path and reuse it verbatim when running depmod
+  # below. Installing into the stock directory while depmod ran against a
+  # hardcoded extra/nvidia is what produced a modules.dep naming a nonexistent
+  # extra/nvidia/nvidia.ko, so `modprobe nvidia-modeset` reported the module as
+  # missing while nvidia.ko was loaded.
+  MODBASE="${STAGE}/usr/lib/modules/${KERNEL_RELEASE}"
+  FOUND="$(find "${MODBASE}" -name 'nvidia.ko*' -printf '%h\n' 2>/dev/null | head -1 || true)"
+  RELDIR=extra/nvidia
+  case "${FOUND}" in
+    "${MODBASE}/"?*) RELDIR="${FOUND#"${MODBASE}/"}" ;;
+  esac
+  MODDIR="${MODBASE}/${RELDIR}"
+  echo "module install dir (relative to the release dir): ${RELDIR}"
 
   # Drop every kernel module the stock raw shipped — those are the open-flavour
   # builds, and anything we don't overwrite must not survive into the output.
@@ -163,6 +157,24 @@ RUN <<EOF
 
   mkdir -p "${MODDIR}"
   cp /build/nv/kernel/*.ko "${MODDIR}/"
+
+  # locate the in-tree modules in the linux-image deb (older debs use /lib, newer /usr/lib)
+  if [ -d "/tmp/image/usr/lib/modules/${KERNEL_RELEASE}" ]; then
+    IMGMOD="/tmp/image/usr/lib/modules/${KERNEL_RELEASE}"
+  else
+    IMGMOD="/tmp/image/lib/modules/${KERNEL_RELEASE}"
+  fi
+
+  # Run depmod over the merged tree (host in-tree modules + ours) so the
+  # regenerated index files carry our additions and resolve against the host's
+  # module set. We ship only the index files; the in-tree modules stay the host's.
+  DEPROOT=/tmp/depmod
+  STAGEMOD="${DEPROOT}/lib/modules/${KERNEL_RELEASE}"
+  rm -rf "${DEPROOT}"
+  mkdir -p "${STAGEMOD}/${RELDIR}"
+  cp -a "${IMGMOD}/." "${STAGEMOD}/"
+  cp /build/nv/kernel/*.ko "${STAGEMOD}/${RELDIR}/"
+  depmod -b "${DEPROOT}" "${KERNEL_RELEASE}"
 
   # Ship the depmod-generated index files. modules.builtin* and modules.devname
   # depend only on the kernel image, not on our additions, so we leave the host's
@@ -184,22 +196,173 @@ RUN <<EOF
   cp /build/nv/nvidia-smi "${SMI}"
   chmod 0755 "${SMI}"
 
-  # libnvidia-ml / libnvidia-cfg: same idea. Replace every versioned copy the
-  # stock raw carries (the version normally matches, so this is an overwrite)
-  # and repoint the SONAME symlinks at ours.
-  for lib in libnvidia-ml libnvidia-cfg; do
-    SRC="/build/nv/${lib}.so.${NVIDIA_DRIVER_VERSION}"
-    [ -f "${SRC}" ] || continue
-    DIRS="$(find "${STAGE}/usr" -name "${lib}.so.*" -printf '%h\n' | sort -u)"
-    DIRS="${DIRS:-${STAGE}/usr/lib/x86_64-linux-gnu}"
-    for d in ${DIRS}; do
+  # Userspace libraries. Replace every versioned copy the stock raw carries (the
+  # version normally matches, so this is an overwrite) and recreate the SONAME
+  # symlink from the library's own DT_SONAME — ldconfig cannot create it for us,
+  # because /usr is read-only once the sysext is merged.
+  #
+  # $1 = library basename, $2 = 1 when the build must fail if the .run lacks it.
+  install_lib() {
+    lib="$1"
+    required="$2"
+    src="/build/nv/${lib}.so.${NVIDIA_DRIVER_VERSION}"
+    if [ ! -f "${src}" ]; then
+      if [ "${required}" = 1 ]; then
+        echo "ERROR: ${lib}.so.${NVIDIA_DRIVER_VERSION} not shipped by this .run" >&2
+        exit 1
+      fi
+      echo "optional ${lib} not in this driver branch - skipped"
+      return 0
+    fi
+    # Only 64-bit destinations: the .run's 32-bit libraries live under 32/ and we
+    # do not ship them, so an i386 directory in the stock raw must not get ours.
+    # `|| true`: grep exits 1 when the stage carries no copy at all (always on the
+    # fallback path), and pipefail would otherwise abort the build here.
+    dirs="$(find "${STAGE}/usr" -name "${lib}.so.*" -printf '%h\n' \
+            | grep -v -e i386 -e '/lib32' | sort -u || true)"
+    dirs="${dirs:-${STAGE}/usr/lib/x86_64-linux-gnu}"
+    soname="$(readelf -d "${src}" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
+    soname="${soname:-${lib}.so.${NVIDIA_DRIVER_VERSION}}"
+    for d in ${dirs}; do
       mkdir -p "${d}"
       find "${d}" -maxdepth 1 \( -name "${lib}.so" -o -name "${lib}.so.*" \) -delete
-      cp "${SRC}" "${d}/"
-      ln -s "${lib}.so.${NVIDIA_DRIVER_VERSION}" "${d}/${lib}.so.1"
-      ln -s "${lib}.so.1" "${d}/${lib}.so"
+      cp "${src}" "${d}/"
+      [ "${soname}" = "${lib}.so.${NVIDIA_DRIVER_VERSION}" ] \
+        || ln -s "${lib}.so.${NVIDIA_DRIVER_VERSION}" "${d}/${soname}"
+      ln -s "${soname}" "${d}/${lib}.so"
+      echo "  ${d}/${lib}.so -> ${soname} -> ${lib}.so.${NVIDIA_DRIVER_VERSION}"
     done
+  }
+
+  # Required for Vulkan. libGLX_nvidia is the ICD itself; libnvidia-glvkspirv is
+  # the SPIR-V compiler, so nothing renders without it.
+  for lib in libGLX_nvidia libnvidia-glcore libnvidia-glvkspirv \
+             libnvidia-glsi libnvidia-tls libnvidia-eglcore \
+             libnvidia-ml libnvidia-cfg; do
+    install_lib "${lib}" 1
   done
+
+  # Present only on some branches: no RT cores on Pascal, and the Wayland
+  # producer is not built everywhere.
+  for lib in libnvidia-rtcore libnvidia-vulkan-producer libnvidia-gpucomp; do
+    install_lib "${lib}" 0
+  done
+
+  # nvidia-modprobe loads the modules and creates /dev/nvidiactl, /dev/nvidia0,
+  # /dev/nvidia-modeset and the dynamic-major /dev/nvidia-uvm* nodes. It goes
+  # through modprobe(8), so the /etc/modprobe.d/nvidia.conf that TrueNAS writes
+  # when a GPU is isolated for a VM is still honoured.
+  install -D -m 0755 /build/nv/nvidia-modprobe "${STAGE}/usr/bin/nvidia-modprobe"
+
+  # Vulkan ICD manifest. Recent .run files ship a template with a placeholder
+  # library path; older ones ship the finished JSON.
+  mkdir -p "${STAGE}/usr/share/vulkan/icd.d"
+  ICD="${STAGE}/usr/share/vulkan/icd.d/nvidia_icd.json"
+  if [ -f /build/nv/nvidia_icd.json.template ]; then
+    sed 's|__NV_VK_ICD__|libGLX_nvidia.so.0|' \
+      /build/nv/nvidia_icd.json.template > "${ICD}"
+  elif [ -f /build/nv/nvidia_icd.json ]; then
+    cp /build/nv/nvidia_icd.json "${ICD}"
+  else
+    cat > "${ICD}" <<ICDEOF
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "libGLX_nvidia.so.0",
+        "api_version": "1.3.0"
+    }
+}
+ICDEOF
+  fi
+  chmod 0644 "${ICD}"
+  cat "${ICD}"
+
+  # Implicit Vulkan layers and the EGL vendor manifest, when the branch has them.
+  # libnvidia-container mounts these into GPU containers alongside the ICD when
+  # NVIDIA_DRIVER_CAPABILITIES includes "graphics".
+  if [ -f /build/nv/nvidia_layers.json ]; then
+    install -D -m 0644 /build/nv/nvidia_layers.json \
+      "${STAGE}/usr/share/vulkan/implicit_layer.d/nvidia_layers.json"
+  fi
+  if [ -f /build/nv/10_nvidia.json ]; then
+    install -D -m 0644 /build/nv/10_nvidia.json \
+      "${STAGE}/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+  fi
+
+  # Report what libGLX_nvidia pulls in. glvnd (libGLdispatch.so.0) is deliberately
+  # not shipped: it belongs to the host's/container's libglvnd, and overwriting it
+  # from the .run would hijack every other GL user on the NAS.
+  GLX="$(find "${STAGE}/usr" -name 'libGLX_nvidia.so.'"${NVIDIA_DRIVER_VERSION}" | head -1 || true)"
+  readelf -d "${GLX}" | grep NEEDED || true
+
+  # Boot-time module load. NVIDIA's Vulkan ICD fails to initialise unless
+  # nvidia-modeset.ko is loaded, and nothing on TrueNAS loads it on its own.
+  #
+  # A modules-load.d drop-in is not usable here: systemd-modules-load.service and
+  # systemd-sysext.service are both only ordered Before=sysinit.target with no
+  # ordering between them, and the former's ConditionDirectoryNotEmpty is
+  # evaluated before the merge — so it would race, and usually lose. A unit wanted
+  # by multi-user.target runs well after the merge instead.
+  #
+  # A sysext cannot write /etc, but systemd honours .wants/ symlinks under
+  # /usr/lib/systemd/system, so the unit can ship enabled.
+  mkdir -p "${STAGE}/usr/lib/systemd/system/multi-user.target.wants" \
+           "${STAGE}/usr/lib/nvidia-legacy"
+
+  cat > "${STAGE}/usr/lib/nvidia-legacy/load-nvidia.sh" <<'SHEOF'
+#!/bin/sh
+# Load the NVIDIA modules and create the device nodes, unless every NVIDIA GPU in
+# the box is isolated for VM passthrough.
+#
+# TrueNAS applies isolation from the initramfs (it writes the PCI IDs into
+# /etc/modprobe.d/vfio.conf, /etc/modprobe.d/nvidia.conf, /etc/modules and
+# /etc/initramfs-tools/modules), so by the time this runs vfio-pci has long since
+# claimed the isolated devices and cannot lose them to us. All we have to do is
+# not fail the unit when there is nothing left for the host to drive.
+set -eu
+
+for dev in /sys/bus/pci/devices/*; do
+    [ -r "$dev/vendor" ] || continue
+    [ "$(cat "$dev/vendor")" = 0x10de ] || continue
+    case "$(cat "$dev/class")" in 0x03*) ;; *) continue ;; esac
+
+    driver=
+    if [ -e "$dev/driver" ]; then
+        driver=$(basename "$(readlink -f "$dev/driver")")
+    fi
+    if [ "$driver" = vfio-pci ]; then
+        continue
+    fi
+
+    # nvidia-modprobe goes through modprobe(8), so /etc/modprobe.d still applies.
+    # -m loads nvidia-modeset (required by the Vulkan ICD), -u loads nvidia-uvm
+    # (CUDA), -c 0 creates /dev/nvidiactl and /dev/nvidia0.
+    exec nvidia-modprobe -m -u -c 0
+done
+
+echo "no host-owned NVIDIA GPU (all isolated for VM passthrough?) - nothing to load"
+SHEOF
+  chmod 0755 "${STAGE}/usr/lib/nvidia-legacy/load-nvidia.sh"
+
+  cat > "${STAGE}/usr/lib/systemd/system/nvidia-legacy-modules.service" <<'UNITEOF'
+[Unit]
+Description=Load NVIDIA kernel modules and create device nodes
+Documentation=https://github.com/libf-de/truenas-nvidia-legacy
+After=systemd-sysext.service local-fs.target
+ConditionPathExists=/usr/bin/nvidia-modprobe
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/nvidia-legacy/load-nvidia.sh
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+  chmod 0644 "${STAGE}/usr/lib/systemd/system/nvidia-legacy-modules.service"
+
+  ln -sf ../nvidia-legacy-modules.service \
+    "${STAGE}/usr/lib/systemd/system/multi-user.target.wants/nvidia-legacy-modules.service"
 
   # Keep the stock extension-release if it already matches any host ID.
   REL="${STAGE}/usr/lib/extension-release.d/extension-release.nvidia"
@@ -238,6 +401,55 @@ RUN <<EOF
   # every module in the output must be one we just built
   diff <(cd /build/nv/kernel && ls *.ko | sort) \
        <(find /stage/usr/lib/modules -name '*.ko*' -printf '%f\n' | sort)
+
+  # Every path our shipped modules.dep names has to exist under the same
+  # /usr/lib/modules/<release> we ship — otherwise modprobe reports
+  # "module not found" for a module that is right there on disk.
+  MODBASE="/stage/usr/lib/modules/${KERNEL_RELEASE}"
+  test -f "${MODBASE}/modules.dep"
+  for m in $(cd /build/nv/kernel && ls *.ko); do
+    LINE="$(grep -m1 -E "(^|/)${m}:" "${MODBASE}/modules.dep" || true)"
+    test -n "${LINE}" \
+      || { echo "ERROR: ${m} has no modules.dep entry" >&2; exit 1; }
+    P="${LINE%%:*}"
+    test -f "${MODBASE}/${P}" \
+      || { echo "ERROR: modules.dep points at ${P}, which is not in the tree" >&2; exit 1; }
+    echo "  modules.dep -> ${P}"
+  done
+
+  # Vulkan: the ICD manifest, the ICD itself under its SONAME, and the SPIR-V
+  # compiler it feeds shaders to. Missing any one of them means the engine's
+  # device enumeration comes up empty at runtime, with no useful error.
+  ICD=/stage/usr/share/vulkan/icd.d/nvidia_icd.json
+  test -f "${ICD}" || { echo "ERROR: ${ICD} missing" >&2; exit 1; }
+  grep -q 'libGLX_nvidia.so.0' "${ICD}" \
+    || { echo "ERROR: ${ICD} does not point at libGLX_nvidia.so.0" >&2; cat "${ICD}"; exit 1; }
+  for so in libGLX_nvidia.so.0 libnvidia-glcore.so."${NVIDIA_DRIVER_VERSION}" \
+            libnvidia-glvkspirv.so."${NVIDIA_DRIVER_VERSION}" \
+            libnvidia-glsi.so."${NVIDIA_DRIVER_VERSION}" \
+            libnvidia-tls.so."${NVIDIA_DRIVER_VERSION}" \
+            libnvidia-eglcore.so."${NVIDIA_DRIVER_VERSION}"; do
+    test -n "$(find /stage/usr -name "${so}" -print -quit)" \
+      || { echo "ERROR: ${so} missing from the staged tree" >&2; exit 1; }
+  done
+  # ld.so only finds these if they sit somewhere ldconfig already scans — a
+  # sysext cannot add an /etc/ld.so.conf.d entry — and libnvidia-container
+  # resolves what to bind-mount into a container out of the host ldcache, so a
+  # library outside it is invisible to the container even though it is on disk.
+  ICDDIR="$(find /stage/usr -name 'libGLX_nvidia.so.0' -printf '%h\n' | head -1 || true)"
+  echo "Vulkan ICD directory: ${ICDDIR#/stage}"
+  case "${ICDDIR}" in
+    /stage/usr/lib|/stage/usr/lib/x86_64-linux-gnu) ;;
+    *) echo "ERROR: ${ICDDIR#/stage} is not on the default ldconfig search path" >&2
+       exit 1 ;;
+  esac
+
+  # Device nodes / module autoload.
+  test -x /stage/usr/bin/nvidia-modprobe
+  test -x /stage/usr/lib/nvidia-legacy/load-nvidia.sh
+  sh -n /stage/usr/lib/nvidia-legacy/load-nvidia.sh
+  test -f /stage/usr/lib/systemd/system/nvidia-legacy-modules.service
+  test -L /stage/usr/lib/systemd/system/multi-user.target.wants/nvidia-legacy-modules.service
 EOF
 
 RUN mksquashfs /stage /build/nvidia.raw -all-root -noappend -comp zstd

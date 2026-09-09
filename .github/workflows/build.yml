@@ -98,6 +98,8 @@ jobs:
             else
               echo "- base: stock \`nvidia.raw\` from \`${{ inputs.orig_raw_url }}\` (container toolkit and full driver userland preserved)"
             fi
+            echo "- Vulkan: ICD manifest, \`libGLX_nvidia\`/\`libnvidia-glvkspirv\`/… and \`nvidia-legacy-modules.service\` (loads \`nvidia-modeset\` at boot) are included."
+            echo "- In containers the graphics libraries are only bind-mounted when \`NVIDIA_DRIVER_CAPABILITIES\` includes \`graphics\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload nvidia.raw

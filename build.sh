@@ -58,5 +58,10 @@ cat <<'EOF'
   zfs set readonly=on "$POOL"
   systemd-sysext merge
   ldconfig
-  modprobe nvidia && nvidia-smi
+  systemctl daemon-reload
+  systemctl start nvidia-legacy-modules.service
+  nvidia-smi
+
+Or copy apply-nvidia.sh over and run it instead — it snapshots first and
+post-checks the Vulkan bits.
 EOF
